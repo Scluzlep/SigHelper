@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+"""android-sig: local Android signing key management and GitHub Actions secret sync.
+
+Python standard library only; external tools: keytool, openssl, gh (for GitHub),
+apksigner (for APK verification). Does not modify repository workflows.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+
+DEFAULT_HOME = Path('/root/android-signing')
+SECRET_NAMES = (
+    'SIGNING_KEYSTORE_BASE64',
+    'SIGNING_PASSWORD',
+    'SIGNING_KEY_PASSWORD',
+    'SIGNING_KEY_ALIAS',
+)
+REPO_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$')
+NAME_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$')
+FINGERPRINT_PATTERN = re.compile(r'^[A-F0-9]{64}$')
+
+
+class SigError(Exception):
+    pass
+
+
+def say(msg):
+    print(msg, file=sys.stderr)
+
+
+def fail(message):
+    raise SigError(message)
+
+
+def executable(name):
+    if not shutil.which(name):
+        fail(f'缺少依赖：{name}；请先安装该命令。')
+
+
+def cmd(argv, *, data=None, password=None, check=True):
+    env = os.environ.copy()
+    env['LC_ALL'] = 'C'
+    env['LANG'] = 'C'
+    if password is not None:
+        env['ANDROID_SIG_PASSWORD'] = password
+    try:
+        result = subprocess.run(
+            [str(x) for x in argv],
+            input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, check=False,
+        )
+    except OSError as exc:
+        fail(f'无法启动 {argv[0]}：{exc}')
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode('utf-8', 'replace').strip()
+        # Do not let tools inadvertently echo signing passwords to the terminal.
+        if password:
+            detail = detail.replace(password, '[REDACTED]')
+        fail(f'{argv[0]} 执行失败（退出码 {result.returncode}）' +
+             (f'：{detail[:450]}' if detail else ''))
+    return result
+
+
+def normalize_repo(value):
+    if not REPO_PATTERN.fullmatch(value) or any(part in ('.', '..') for part in value.split('/')):
+        fail('仓库必须是 owner/repo 格式，例如 example/my-app。')
+    return value
+
+
+def local_name(repo, explicit=None):
+    name = explicit if explicit is not None else repo.split('/', 1)[1]
+    if not NAME_PATTERN.fullmatch(name) or name in ('.', '..'):
+        fail('本地名称只能包含字母、数字、点、下划线、连字符，且不能是 . 或 ..。')
+    return name
+
+
+def ensure_not_symlink(path):
+    if path.is_symlink():
+        fail(f'拒绝操作符号链接：{path}')
+
+
+def create_home(home):
+    ensure_not_symlink(home)
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ensure_not_symlink(home)
+    if not home.is_dir():
+        fail(f'签名根目录不是目录：{home}')
+    os.chmod(home, 0o700)
+
+
+@contextmanager
+def locked_home(home):
+    create_home(home)
+    lock = home / '.android-sig.lock'
+    ensure_not_symlink(lock)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def dir_for(home, name):
+    return home / f'{name}-signing'
+
+
+def ensure_directory(path):
+    ensure_not_symlink(path)
+    if not path.is_dir():
+        fail(f'签名目录不存在：{path}')
+    os.chmod(path, 0o700)
+
+
+def safe_read_file(path):
+    ensure_not_symlink(path)
+    if not path.is_file():
+        fail(f'签名文件不存在：{path}')
+    os.chmod(path, 0o600)
+    # Refuse symlinks at open time as well.
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    with os.fdopen(fd, 'rb') as stream:
+        return stream.read()
+
+
+def read_password(folder):
+    path = folder / 'release.p12.password.txt'
+    data = safe_read_file(path)
+    try:
+        value = data.decode('utf-8').rstrip('\r\n')
+    except UnicodeDecodeError:
+        fail('密码文件不是 UTF-8 文本。')
+    if value.startswith('passwd='):
+        value = value[len('passwd='):]
+    if not value or '\n' in value or '\r' in value or '\x00' in value:
+        fail('密码文件格式无效；支持 passwd=<密码> 或纯文本单行密码。')
+    return value
+
+
+def keytool_args(keystore):
+    return [
+        'keytool', '-J-Duser.language=en', '-J-Duser.country=US',
+        '-keystore', str(keystore), '-storetype', 'PKCS12',
+        '-storepass:env', 'ANDROID_SIG_PASSWORD',
+    ]
+
+
+def private_aliases(keystore, password):
+    # Explicitly check store integrity; do not rely on passwordless -list.
+    argv = ['keytool', '-J-Duser.language=en', '-J-Duser.country=US', '-list', '-v',
+            '-keystore', str(keystore), '-storetype', 'PKCS12',
+            '-storepass:env', 'ANDROID_SIG_PASSWORD']
+    listing = cmd(argv, password=password).stdout.decode('utf-8', 'replace')
+    aliases = []
+    active_alias = None
+    for line in listing.splitlines():
+        match = re.match(r'^Alias name:\s*(.+?)\s*$', line)
+        if match:
+            active_alias = match.group(1)
+        elif 'Entry type: PrivateKeyEntry' in line and active_alias is not None:
+            aliases.append(active_alias)
+    if not aliases:
+        fail('PKCS12 中没有可用的 PrivateKeyEntry，不能用于 APK 签名。')
+    return aliases
+
+
+def cert_dates(cert_pem):
+    output = cmd(['openssl', 'x509', '-noout', '-startdate', '-enddate'], data=cert_pem)
+    fields = dict(line.split('=', 1) for line in output.stdout.decode().splitlines() if '=' in line)
+    result = []
+    for key in ('notBefore', 'notAfter'):
+        if key not in fields:
+            fail('无法解析 X.509 证书的有效期。')
+        try:
+            stamp = dt.datetime.strptime(' '.join(fields[key].split()), '%b %d %H:%M:%S %Y %Z')
+        except ValueError:
+            fail(f'无法解析证书日期：{fields[key]}')
+        result.append(stamp.replace(tzinfo=dt.timezone.utc))
+    return result
+
+
+def public_key_der(pem):
+    return cmd(['openssl', 'pkey', '-pubin', '-outform', 'DER'], data=pem).stdout
+
+
+def inspect_key(folder, preferred_alias=None):
+    ensure_directory(folder)
+    keystore = folder / 'release.p12'
+    safe_read_file(keystore)  # Checks presence, symlink, and permissions.
+    password = read_password(folder)
+    executable('keytool')
+    executable('openssl')
+    aliases = private_aliases(keystore, password)
+    if preferred_alias is None:
+        if len(aliases) != 1:
+            fail(f'发现多个私钥 Alias（{", ".join(aliases)}），请使用 adopt --alias 指定。')
+        alias = aliases[0]
+    else:
+        if preferred_alias not in aliases:
+            fail(f'指定 Alias 不存在或不是私钥条目：{preferred_alias}；可用：{", ".join(aliases)}')
+        alias = preferred_alias
+
+    prefix = ['keytool', '-J-Duser.language=en', '-J-Duser.country=US']
+    common = ['-alias', alias, '-keystore', str(keystore),
+              '-storetype', 'PKCS12', '-storepass:env', 'ANDROID_SIG_PASSWORD']
+    cert = cmd(prefix + ['-exportcert', '-rfc'] + common, password=password).stdout
+    csr = cmd(prefix + ['-certreq', '-rfc'] + common +
+              ['-keypass:env', 'ANDROID_SIG_PASSWORD'], password=password).stdout
+    # The CSR is signed by the private key and contains its public key.
+    cmd(['openssl', 'req', '-verify', '-noout'], data=csr)
+    cert_pub = cmd(['openssl', 'x509', '-pubkey', '-noout'], data=cert).stdout
+    csr_pub = cmd(['openssl', 'req', '-pubkey', '-noout'], data=csr).stdout
+    if public_key_der(cert_pub) != public_key_der(csr_pub):
+        fail('证书公钥与私钥生成的 CSR 公钥不匹配。')
+
+    start, end = cert_dates(cert)
+    now = dt.datetime.now(dt.timezone.utc)
+    if start > now:
+        fail(f'证书尚未生效：{start.isoformat()}')
+    if end <= now:
+        fail(f'证书已经过期：{end.isoformat()}')
+
+    der = cmd(['openssl', 'x509', '-outform', 'DER'], data=cert).stdout
+    fingerprint = hashlib.sha256(der).hexdigest().upper()
+    pub_info = cmd(['openssl', 'pkey', '-pubin', '-text', '-noout'], data=cert_pub).stdout.decode('utf-8', 'replace')
+    key_size_match = re.search(r'\((\d+) bit\)', pub_info)
+    key_size = int(key_size_match.group(1)) if key_size_match else None
+    algorithm = 'RSA' if 'modulus:' in pub_info.lower() or 'rsa' in pub_info.lower() else 'OTHER'
+    return {
+        'alias': alias, 'sha256': fingerprint, 'algorithm': algorithm,
+        'key_size': key_size, 'not_before': start.isoformat(), 'not_after': end.isoformat(),
+        'keystore': str(keystore),
+    }
+
+
+def read_metadata(folder):
+    path = folder / 'metadata.json'
+    if not path.exists() and not path.is_symlink():
+        return None
+    try:
+        value = json.loads(safe_read_file(path))
+    except (ValueError, UnicodeDecodeError) as exc:
+        fail(f'metadata.json 无法解析：{exc}')
+    if not isinstance(value, dict) or value.get('schema') != 1:
+        fail('metadata.json 版本无效或格式错误。')
+    return value
+
+
+def validate_binding(meta, repo, info):
+    if not meta:
+        return False
+    bound = meta.get('repository', '')
+    if not isinstance(bound, str) or bound.lower() != repo.lower():
+        fail(f'目录已绑定到 {bound!r}，拒绝用于仓库 {repo}。')
+    if meta.get('alias') != info['alias']:
+        fail('metadata.json 中的 Alias 与实际私钥不一致。')
+    if meta.get('sha256', '').upper().replace(':', '') != info['sha256']:
+        fail('metadata.json 中的证书 SHA-256 与实际证书不一致。')
+    return True
+
+
+def metadata_for(repo, name, info, adopted):
+    return {
+        'schema': 1, 'repository': repo, 'local_name': name,
+        'alias': info['alias'], 'store_type': 'PKCS12',
+        'algorithm': info['algorithm'], 'key_size': info['key_size'],
+        'sha256': info['sha256'],
+        'not_before': info['not_before'], 'not_after': info['not_after'],
+        'adopted': bool(adopted),
+        'bound_at': dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
+
+def atomic_metadata(folder, meta):
+    fd, temp = tempfile.mkstemp(prefix='.metadata.', suffix='.tmp', dir=folder)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(meta, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, folder / 'metadata.json')
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def check_repository(repo):
+    executable('gh')
+    cmd(['gh', 'repo', 'view', repo, '--json', 'nameWithOwner', '--jq', '.nameWithOwner'])
+
+
+def remote_secrets(repo):
+    check_repository(repo)
+    output = cmd(['gh', 'secret', 'list', '--repo', repo, '--json', 'name', '--jq', '.[].name'])
+    return set(output.stdout.decode('utf-8', 'replace').splitlines())
+
+
+def upload_secrets(repo, folder, info):
+    password = read_password(folder)
+    key_content = safe_read_file(folder / 'release.p12')
+    payloads = {
+        'SIGNING_KEYSTORE_BASE64': base64.b64encode(key_content),
+        'SIGNING_PASSWORD': password.encode('utf-8'),
+        'SIGNING_KEY_PASSWORD': password.encode('utf-8'),
+        'SIGNING_KEY_ALIAS': info['alias'].encode('utf-8'),
+    }
+    check_repository(repo)
+    for idx, name in enumerate(SECRET_NAMES, 1):
+        try:
+            cmd(['gh', 'secret', 'set', name, '--repo', repo, '--app', 'actions'],
+                data=payloads[name], password=password)
+        except SigError:
+            say(f'[!] 已上传 {idx-1}/{len(SECRET_NAMES)} 项；GitHub Secrets 不支持批量事务回滚。')
+            say('    本地密钥保持不变，修复连接/权限后运行 android-sig sync 重试。')
+            raise
+        say(f'[OK] GitHub Secret {name} ({idx}/{len(SECRET_NAMES)})')
+
+
+def display_info(repo, name, info, bound):
+    print(f'仓库         : {repo}')
+    print(f'本地目录     : {dir_for(get_home(), name)}')
+    print(f'绑定状态     : {"BOUND" if bound else "UNBOUND (执行 adopt 绑定)"}')
+    print(f'Alias        : {info["alias"]}')
+    print(f'算法         : {info["algorithm"]} {info["key_size"] or "?"}')
+    print(f'SHA-256      : {info["sha256"]}')
+    print(f'生效日期(UTC): {info["not_before"]}')
+    print(f'到期日期(UTC): {info["not_after"]}')
+
+
+def get_home():
+    return Path(os.environ.get('ANDROID_SIG_HOME', str(DEFAULT_HOME))).expanduser().absolute()
+
+
+def load_repo_key(home, repo, name, *, permit_unbound=False, alias=None):
+    folder = dir_for(home, name)
+    ensure_directory(folder)
+    meta = read_metadata(folder)
+    if not meta and not permit_unbound:
+        fail('发现旧签名文件但缺少 metadata.json。请先执行：android-sig adopt ' + repo +
+             (f' {name}' if name != repo.split('/')[1] else ''))
+    chosen_alias = alias or (meta['alias'] if meta else None)
+    info = inspect_key(folder, preferred_alias=chosen_alias)
+    bound = validate_binding(meta, repo, info)
+    return folder, meta, info, bound
+
+
+def command_gen(args):
+    repo = normalize_repo(args.repo)
+    name = local_name(repo, args.local_name)
+    home = get_home()
+    executable('keytool')
+    executable('openssl')
+    with locked_home(home):
+        folder = dir_for(home, name)
+        ensure_not_symlink(folder)
+        if folder.exists():
+            folder, meta, info, _ = load_repo_key(home, repo, name)
+            say('[OK] 已有签名验证通过，复用原证书，不重新生成。')
+        else:
+            if not args.local_only:
+                existing = remote_secrets(repo)
+                collision = sorted(existing.intersection(SECRET_NAMES))
+                if collision and not args.replace_secrets:
+                    fail('仓库已存在签名 Secrets：' + ', '.join(collision) +
+                         '。拒绝生成新的不兼容密钥。若要导入旧证书请用 adopt；'
+                         '确实要替换时必须显式加 --replace-secrets。')
+            temp = Path(tempfile.mkdtemp(prefix=f'.{name}-signing.tmp-', dir=home))
+            os.chmod(temp, 0o700)
+            try:
+                password = secrets.token_hex(24)
+                pw_file = temp / 'release.p12.password.txt'
+                fd = os.open(pw_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                    stream.write(f'passwd={password}\n')
+                keyfile = temp / 'release.p12'
+                dn = f'CN={name}, OU=Android, O=android-sig'
+                argv = ['keytool', '-J-Duser.language=en', '-J-Duser.country=US',
+                        '-genkeypair', '-alias', 'release', '-keyalg', 'RSA',
+                        '-keysize', '3072', '-validity', '36500', '-storetype', 'PKCS12',
+                        '-keystore', str(keyfile), '-storepass:env', 'ANDROID_SIG_PASSWORD',
+                        '-keypass:env', 'ANDROID_SIG_PASSWORD', '-dname', dn, '-noprompt']
+                cmd(argv, password=password)
+                os.chmod(keyfile, 0o600)
+                info = inspect_key(temp, preferred_alias='release')
+                atomic_metadata(temp, metadata_for(repo, name, info, adopted=False))
+                os.rename(temp, folder)
+            finally:
+                if temp.exists():
+                    shutil.rmtree(temp)
+            say('[OK] 新密钥生成、校验及本地保存完成。')
+        # Reload information from final directory and match binding before syncing.
+        folder, meta, info, _ = load_repo_key(home, repo, name)
+        if not args.local_only:
+            upload_secrets(repo, folder, info)
+        display_info(repo, name, info, True)
+        if args.local_only:
+            say('[OK] 仅本地生成，未访问 GitHub。')
+        else:
+            say('[OK] GitHub Actions Secrets 已同步。')
+
+
+def command_adopt(args):
+    repo = normalize_repo(args.repo)
+    name = local_name(repo, args.local_name)
+    home = get_home()
+    with locked_home(home):
+        folder, meta, info, bound = load_repo_key(home, repo, name,
+                                                 permit_unbound=True, alias=args.alias)
+        if not bound:
+            atomic_metadata(folder, metadata_for(repo, name, info, adopted=True))
+            say('[OK] 已绑定现有证书，原 release.p12 / 密码内容保持不变。')
+        else:
+            say('[OK] 此签名目录已经绑定，无需重复迁移。')
+        if args.sync:
+            upload_secrets(repo, folder, info)
+        display_info(repo, name, info, True)
+        if args.sync:
+            say('[OK] 旧签名已同步到 GitHub Secrets。')
+
+
+def command_sync(args):
+    repo = normalize_repo(args.repo)
+    name = local_name(repo, args.local_name)
+    home = get_home()
+    with locked_home(home):
+        folder, meta, info, bound = load_repo_key(home, repo, name)
+        upload_secrets(repo, folder, info)
+        display_info(repo, name, info, bound)
+        say('[OK] GitHub Secrets 同步完成。')
+
+
+def verify_apk(apk_path, expected=None):
+    executable('apksigner')
+    apk = Path(apk_path).expanduser().absolute()
+    if not apk.is_file():
+        fail(f'APK 文件不存在：{apk}')
+    result = cmd(['apksigner', 'verify', '--print-certs', str(apk)])
+    output = result.stdout.decode('utf-8', 'replace')
+    digests = re.findall(r'^Signer\s+#\d+\s+certificate SHA-256 digest:\s*([0-9a-fA-F:]+)\s*$',
+                         output, re.MULTILINE)
+    if not digests:
+        fail('APK 签名验证工具未输出签名者 SHA-256，无法确认签名证书。')
+    digests = [v.replace(':', '').upper() for v in digests]
+    if any(not FINGERPRINT_PATTERN.fullmatch(x) for x in digests):
+        fail('APK 签名证书指纹格式异常。')
+    if expected and (len(digests) != 1 or digests[0] != expected):
+        fail(f'APK 签名有效但与本地证书不一致！本地：{expected}；APK：{", ".join(digests)}')
+    return {'apk': str(apk), 'valid': True, 'signer_sha256': digests,
+            'matches_local': expected is not None and len(digests) == 1 and digests[0] == expected}
+
+
+def command_veri(args):
+    if not args.repo and not args.apk:
+        fail('veri 至少需要 <owner/repo> 或 --apk <file.apk>。')
+    if args.local_name and not args.repo:
+        fail('只有提供 <owner/repo> 时才能指定本地名称。')
+    home = get_home()
+    info = None
+    output = {'status': 'PASSED'}
+    if args.repo:
+        repo = normalize_repo(args.repo)
+        name = local_name(repo, args.local_name)
+        with locked_home(home):
+            folder, meta, info, bound = load_repo_key(home, repo, name, permit_unbound=True)
+            output.update({'repository': repo, 'local_name': name,
+                           'directory': str(folder), 'bound': bound, 'certificate': info})
+            if args.remote:
+                existing = remote_secrets(repo)
+                missing = [x for x in SECRET_NAMES if x not in existing]
+                output['remote_secrets_present'] = [x for x in SECRET_NAMES if x in existing]
+                output['remote_secrets_missing'] = missing
+                if missing:
+                    fail('GitHub Actions Secrets 缺失：' + ', '.join(missing))
+        if not args.json:
+            display_info(repo, name, info, bound)
+            say('[OK] 本地 PKCS12、Alias、CSR 私钥证明、证书公钥及有效期验证通过。')
+            if args.remote:
+                say('[OK] GitHub Actions Secrets 名称存在（无法读取明文作一致性比较）。')
+    elif args.remote:
+        fail('--remote 需要指定 <owner/repo>。')
+    if args.apk:
+        output['apk'] = verify_apk(args.apk, info['sha256'] if info else None)
+        if not args.json:
+            print(f'APK          : {output["apk"]["apk"]}')
+            print('签名证书     : ' + ', '.join(output['apk']['signer_sha256']))
+            say('[OK] APK 签名有效' + ('，且与本地证书匹配。' if info else '。'))
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
+def command_list(args):
+    home = get_home()
+    entries = []
+    with locked_home(home):
+        for folder in sorted(home.glob('*-signing')):
+            if not folder.is_dir() or folder.is_symlink():
+                continue
+            name = folder.name[:-len('-signing')]
+            try:
+                meta = read_metadata(folder)
+                info = inspect_key(folder, preferred_alias=meta.get('alias') if meta else None)
+                if meta:
+                    validate_binding(meta, meta.get('repository', ''), info)
+                entries.append({'local_name': name, 'repository': meta.get('repository') if meta else None,
+                                'status': 'VALID' if meta else 'UNBOUND', 'alias': info['alias'],
+                                'sha256': info['sha256']})
+            except (SigError, OSError) as exc:
+                entries.append({'local_name': name, 'repository': None, 'status': 'INVALID',
+                                'error': str(exc)})
+    if args.json:
+        print(json.dumps(entries, ensure_ascii=False, indent=2))
+    else:
+        if not entries:
+            print('尚无签名目录。')
+        else:
+            print(f'{"LOCAL NAME":<26} {"REPOSITORY":<35} STATUS')
+            for entry in entries:
+                print(f'{entry["local_name"]:<26} {(entry.get("repository") or "-"):<35} {entry["status"]}')
+                if 'error' in entry and args.verbose:
+                    say('    ' + entry['error'])
+
+
+def make_parser():
+    p = argparse.ArgumentParser(
+        prog='android-sig',
+        description='Android APK 签名密钥管理：生成、旧目录绑定、验证与 GitHub Actions Secrets 同步。',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''示例：
+  android-sig help gen
+  android-sig gen example/my-app
+  android-sig gen example/my-app custom-name --local-only
+  android-sig adopt example/my-app
+  android-sig adopt example/legacy-app ncm --sync
+  android-sig sync example/my-app
+  android-sig veri example/my-app --remote
+  android-sig veri example/my-app --apk app-release.apk
+  android-sig veri --apk app-release.apk
+  android-sig list
+
+目录约定：
+  /root/android-signing/<local-name>-signing/
+    release.p12                 PKCS12 签名密钥库
+    release.p12.password.txt    密码（支持 passwd=... 或纯文本）
+    metadata.json               仓库绑定 / Alias / 证书指纹（不含私钥和密码）
+
+固定上传的 GitHub Actions Secrets：
+  SIGNING_KEYSTORE_BASE64  base64 编码的完整 release.p12
+  SIGNING_PASSWORD         PKCS12 密钥库密码
+  SIGNING_KEY_PASSWORD     私钥密码（PKCS12 默认与密钥库密码相同）
+  SIGNING_KEY_ALIAS        实际私钥 Alias（旧库自动识别）
+
+规则与安全：
+  * gen 默认创建或复用签名，并同步 GitHub；--local-only 禁止网络同步。
+  * gen 不覆盖已有签名；旧目录无 metadata.json 时须先 adopt。
+  * adopt 仅创建 metadata.json，原密钥和密码不变；--sync 才上传 GitHub。
+  * sync 重传已有已绑定签名，可能覆盖 GitHub 同名 Secrets。
+  * veri 本地验证包含 CSR 私钥证明 / 证书公钥匹配 / 证书有效期。
+  * veri --remote 只验证 Secrets 名称是否存在，无法读取远程 Secret 明文。
+  * veri --apk 使用 apksigner 验证 APK 的真实签名及证书指纹。
+  * 新签名遇到 GitHub 已有同名 Secrets 时拒绝，除非 --replace-secrets。
+  * 不修改 GitHub Actions 工作流 YAML，不把密钥推送到 Git 仓库。
+  * 环境变量 ANDROID_SIG_HOME 可覆盖根目录（用于迁移或测试）。
+
+依赖：Python 3.9+、keytool、openssl；同步时需 gh 登录及仓库 Secrets 写权限；
+      APK 验证需 Android SDK build-tools 中的 apksigner。
+''')
+    sub = p.add_subparsers(dest='command', required=True)
+
+    h = sub.add_parser('help', help='显示总帮助，或某个子命令的详细帮助')
+    h.add_argument('topic', nargs='?', choices=['gen', 'adopt', 'sync', 'veri', 'list'],
+                   help='要查看的子命令，例如 gen')
+    h.set_defaults(func=lambda args: (sub.choices[args.topic].print_help()
+                                      if args.topic else p.print_help()))
+
+    g = sub.add_parser('gen', help='生成新签名或复用已绑定签名，并默认同步 GitHub')
+    g.add_argument('repo', metavar='<owner/repo>', help='GitHub 仓库，例如 example/my-app')
+    g.add_argument('local_name', nargs='?', metavar='[local-name]', help='可选本地目录名；默认仓库名')
+    g.add_argument('--local-only', action='store_true', help='只生成/验证本地签名，不调用 gh')
+    g.add_argument('--replace-secrets', action='store_true', help='允许新建密钥时覆盖仓库已有签名 Secrets（危险）')
+    g.set_defaults(func=command_gen)
+
+    a = sub.add_parser('adopt', help='迁移现有签名目录：验证后补充 metadata.json，不替换密钥')
+    a.add_argument('repo', metavar='<owner/repo>', help='绑定的 GitHub 仓库')
+    a.add_argument('local_name', nargs='?', metavar='[local-name]', help='已有目录名，不含 -signing')
+    a.add_argument('--alias', help='多个 PrivateKeyEntry 时手工选择 Alias')
+    a.add_argument('--sync', action='store_true', help='迁移完成后同步 GitHub Actions Secrets')
+    a.set_defaults(func=command_adopt)
+
+    s = sub.add_parser('sync', help='验证已绑定的本地签名，并覆盖更新 GitHub Actions Secrets')
+    s.add_argument('repo', metavar='<owner/repo>', help='目标 GitHub 仓库')
+    s.add_argument('local_name', nargs='?', metavar='[local-name]', help='本地名称')
+    s.set_defaults(func=command_sync)
+
+    v = sub.add_parser('veri', help='验证 PKCS12 / APK 签名，以及可选的远程 Secrets 存在性')
+    v.add_argument('repo', nargs='?', metavar='[owner/repo]', help='可省略；仅 --apk 时独立验证 APK')
+    v.add_argument('local_name', nargs='?', metavar='[local-name]', help='本地名称')
+    v.add_argument('--apk', metavar='FILE.apk', help='检查 APK 签名有效性，并可与本地证书比对')
+    v.add_argument('--remote', action='store_true', help='检查 GitHub Actions 是否存在四个签名 Secret')
+    v.add_argument('--json', action='store_true', help='输出 JSON 供自动化使用')
+    v.set_defaults(func=command_veri)
+
+    l = sub.add_parser('list', help='扫描签名目录并显示验证状态')
+    l.add_argument('--json', action='store_true', help='输出 JSON')
+    l.add_argument('--verbose', action='store_true', help='额外显示损坏原因，不打印密码')
+    l.set_defaults(func=command_list)
+    return p
+
+
+def main(argv=None):
+    parser = make_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, 'local_only', False) and getattr(args, 'replace_secrets', False):
+        parser.error('--local-only 不能与 --replace-secrets 同时使用。')
+    try:
+        args.func(args)
+    except SigError as exc:
+        say('[ERROR] ' + str(exc))
+        return 1
+    except KeyboardInterrupt:
+        say('\n[ERROR] 已取消。')
+        return 130
+    except OSError as exc:
+        say('[ERROR] 文件系统操作失败：' + str(exc))
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
