@@ -1,0 +1,18 @@
+# Never commit real signing material
+*-signing/
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.key
+*.pem
+*.password.txt
+.env
+.env.*
+# Local state and test artifacts
+.android-sig.lock
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.apk
+.DS_Store
