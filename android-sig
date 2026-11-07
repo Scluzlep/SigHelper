@@ -346,7 +346,7 @@ def display_info(repo, name, info, bound):
 
 
 def get_home():
-    return Path(os.environ.get('ANDROID_SIG_HOME', str(DEFAULT_HOME))).expanduser().absolute()
+    return Path(os.environ.get('ANDROID_SIG_HOME', str(DEFAULT_HOME))).expanduser().resolve(strict=False)
 
 
 def load_repo_key(home, repo, name, *, permit_unbound=False, alias=None):
